@@ -1,4 +1,4 @@
-supabase/schema.sql
+
 -- OlympIA initial schema scaffold.
 -- Review and test in a non-production Supabase project before applying to production.
 -- Admin authorization is based on the trusted JWT app_metadata claim: role = 'admin'.
