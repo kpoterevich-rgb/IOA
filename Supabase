@@ -1,1 +1,146 @@
 supabase/schema.sql
+-- OlympIA initial schema scaffold.
+-- Review and test in a non-production Supabase project before applying to production.
+-- Admin authorization is based on the trusted JWT app_metadata claim: role = 'admin'.
+create extension if not exists pgcrypto;
+create table if not exists public.profiles (
+  id uuid primary key references auth.users(id) on delete cascade,
+  display_name text not null check (char_length(display_name) between 1 and 60),
+  grade smallint not null check (grade between 1 and 12),
+  created_at timestamptz not null default now()
+);
+create table if not exists public.olympiads (
+  id uuid primary key default gen_random_uuid(),
+  slug text not null unique,
+  title text not null check (char_length(title) between 1 and 160),
+  subject text not null,
+  grade smallint not null check (grade between 1 and 12),
+  duration_minutes smallint not null default 90 check (duration_minutes between 1 and 180),
+  status text not null default 'draft' check (status in ('draft','published','archived')),
+  language_code text not null default 'en' check (language_code in ('en','ru','de','fr','es')),
+  created_by uuid references auth.users(id),
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+-- Public question rows intentionally contain NO correct answer.
+create table if not exists public.questions (
+  id uuid primary key default gen_random_uuid(),
+  olympiad_id uuid not null references public.olympiads(id) on delete cascade,
+  position smallint not null check (position between 1 and 100),
+  prompt text not null check (char_length(prompt) between 1 and 5000),
+  options jsonb not null check (jsonb_typeof(options) = 'array' and jsonb_array_length(options) between 2 and 8),
+  points smallint not null default 2 check (points between 0 and 20),
+  category text,
+  unique (olympiad_id, position)
+);
+-- Correct answers are in a separate table that must never be readable by ordinary participants.
+create table if not exists public.answer_keys (
+  question_id uuid primary key references public.questions(id) on delete cascade,
+  correct_index smallint not null check (correct_index between 0 and 7),
+  explanation text
+);
+create table if not exists public.attempts (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null references auth.users(id) on delete cascade,
+  olympiad_id uuid not null references public.olympiads(id),
+  score integer not null default 0 check (score >= 0),
+  started_at timestamptz not null default now(),
+  submitted_at timestamptz,
+  status text not null default 'in_progress' check (status in ('in_progress','submitted','expired')),
+  unique (id, user_id)
+);
+create table if not exists public.attempt_answers (
+  attempt_id uuid not null references public.attempts(id) on delete cascade,
+  question_id uuid not null references public.questions(id) on delete cascade,
+  selected_index smallint not null check (selected_index between 0 and 7),
+  answered_at timestamptz not null default now(),
+  primary key (attempt_id, question_id)
+);
+-- A minimal public ranking projection. Only intentionally public fields belong here.
+create table if not exists public.public_ranking (
+  id uuid primary key default gen_random_uuid(),
+  display_name text not null,
+  grade smallint not null check (grade between 1 and 12),
+  subject text not null,
+  score integer not null check (score >= 0),
+  submitted_at timestamptz not null default now(),
+  olympiad_id uuid references public.olympiads(id) on delete set null
+);
+create or replace function public.is_admin()
+returns boolean
+language sql
+stable
+as $$
+  select coalesce((auth.jwt() -> 'app_metadata' ->> 'role') = 'admin', false);
+$$;
+alter table public.profiles enable row level security;
+alter table public.olympiads enable row level security;
+alter table public.questions enable row level security;
+alter table public.answer_keys enable row level security;
+alter table public.attempts enable row level security;
+alter table public.attempt_answers enable row level security;
+alter table public.public_ranking enable row level security;
+-- Profiles: each participant can read/update only their own profile; admin can manage all.
+create policy "profile read own or admin" on public.profiles
+for select using (auth.uid() = id or public.is_admin());
+create policy "profile insert own" on public.profiles
+for insert with check (auth.uid() = id);
+create policy "profile update own or admin" on public.profiles
+for update using (auth.uid() = id or public.is_admin())
+with check (auth.uid() = id or public.is_admin());
+-- Participants may read only published olympiads; only admins can change them.
+create policy "published olympiads readable" on public.olympiads
+for select using (status = 'published' or public.is_admin());
+create policy "admin manages olympiads" on public.olympiads
+for all using (public.is_admin()) with check (public.is_admin());
+create policy "questions for published olympiads readable" on public.questions
+for select using (
+  public.is_admin() or exists (
+    select 1 from public.olympiads o
+    where o.id = olympiad_id and o.status = 'published'
+  )
+);
+create policy "admin manages questions" on public.questions
+for all using (public.is_admin()) with check (public.is_admin());
+create policy "answer keys admin only" on public.answer_keys
+for all using (public.is_admin()) with check (public.is_admin());
+create policy "attempts own or admin" on public.attempts
+for select using (auth.uid() = user_id or public.is_admin());
+create policy "attempts insert own" on public.attempts
+for insert with check (auth.uid() = user_id);
+create policy "attempts update own in progress" on public.attempts
+for update using (auth.uid() = user_id and status = 'in_progress')
+with check (auth.uid() = user_id);
+create policy "admin manages attempts" on public.attempts
+for all using (public.is_admin()) with check (public.is_admin());
+create policy "attempt answers own attempt or admin" on public.attempt_answers
+for select using (
+  public.is_admin() or exists (
+    select 1 from public.attempts a
+    where a.id = attempt_id and a.user_id = auth.uid()
+  )
+);
+create policy "answers insert into own active attempt" on public.attempt_answers
+for insert with check (
+  exists (
+    select 1 from public.attempts a
+    where a.id = attempt_id and a.user_id = auth.uid() and a.status = 'in_progress'
+  )
+);
+create policy "admin manages attempt answers" on public.attempt_answers
+for all using (public.is_admin()) with check (public.is_admin());
+create policy "public can read public ranking" on public.public_ranking
+for select using (true);
+create policy "admin manages public ranking" on public.public_ranking
+for all using (public.is_admin()) with check (public.is_admin());
+grant usage on schema public to anon, authenticated;
+grant select on public.olympiads, public.questions, public.public_ranking to anon, authenticated;
+grant select, insert, update on public.profiles to authenticated;
+grant select, insert, update on public.attempts, public.attempt_answers to authenticated;
+grant select, insert, update, delete on public.olympiads, public.questions, public.answer_keys, public.public_ranking to authenticated;
+-- IMPORTANT:
+-- This schema is a starting point, not a complete secure contest engine.
+-- Do not score attempts in the browser. Add a server-side submit_attempt RPC/Edge Function
+-- that validates attempt timing, question IDs, selections, one-time submission, and score.
+-- Consider restricting direct updates/inserts to attempts and attempt_answers further,
+-- and test all policies with participant/admin accounts before public release.
